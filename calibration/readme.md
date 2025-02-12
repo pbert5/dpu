@@ -22,7 +22,7 @@ For Windows, use py instead of python for all commands.
 ### Calibrate Temperature
 ```python3 calibration/calibrate.py -a <ip_address> -n <file_name> -t linear -f <name_after_fit> -p temp```
 
-### List raw OD JSON files logged on evolver
+### Calibrate OD
 **OD135:**
 
 ```python3 calibration/calibrate.py -a <ip_address> -n <file_name> -t sigmoid -f <name_after_fit> -p od_135```
