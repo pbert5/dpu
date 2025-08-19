@@ -24,9 +24,9 @@ TEMP_INITIAL = [30] * 16 #degrees C, makes 16-value list
 #Alternatively enter 16-value list to set different values
 #TEMP_INITIAL = [30,30,30,30,32,32,32,32,34,34,34,34,36,36,36,36]
 
-STIR_INITIAL = [8] * 16 #try 8,10,12 etc; makes 16-value list
+STIR_INITIAL = [4] * 16 #try 2,3,4 etc; makes 16-value list
 #Alternatively enter 16-value list to set different values
-#STIR_INITIAL = [7,7,7,7,8,8,8,8,9,9,9,9,10,10,10,10]
+#STIR_INITIAL = [2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5]
 
 VOLUME =  25 #mL, determined by vial cap straw length
 OPERATION_MODE = 'turbidostat' #use to choose between 'turbidostat' and 'chemostat' functions
