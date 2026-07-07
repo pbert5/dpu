@@ -29,5 +29,5 @@ def file_scan(tag):
 
 
 sidebar_links, subdir_log = file_scan('BW_temppid_expt2_20151019')
-print sidebar_links
-print subdir_log
+print(sidebar_links)
+print(subdir_log)
