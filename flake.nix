@@ -54,6 +54,57 @@
             })
           ];
         };
+
+      mkDpuPython =
+        pkgs:
+        let
+          inherit (poetry2nix.lib.mkPoetry2Nix { inherit pkgs; })
+            mkPoetryEnv
+            defaultPoetryOverrides
+            ;
+        in
+        mkPoetryEnv {
+          projectDir = ./.;
+          python =
+            if pkgs ? python36 then pkgs.python36
+            else if pkgs ? python39 then pkgs.python39
+            else pkgs.python311;
+          preferWheels = true;
+          extraPackages = ps: [ ps.python-socketio ];
+
+          overrides = defaultPoetryOverrides.extend (
+            _final: prev: {
+              # bokeh 0.10.0 pre-dates PEP 517 — needs setuptools.
+              # Its setup.py calls getsitepackages()[0] which throws
+              # IndexError in the Nix sandbox (empty list); patch it.
+              bokeh = prev.bokeh.overridePythonAttrs (old: {
+                buildInputs = (old.buildInputs or [ ]) ++ [ prev.setuptools ];
+                postPatch = ''
+                  substituteInPlace setup.py \
+                    --replace 'getsitepackages()[0]' "(getsitepackages() or ['/tmp'])[0]"
+                '';
+              });
+              django = prev.django.overridePythonAttrs (old: {
+                buildInputs = (old.buildInputs or [ ]) ++ [ prev.setuptools ];
+              });
+              django-crispy-forms = prev.django-crispy-forms.overridePythonAttrs (old: {
+                buildInputs = (old.buildInputs or [ ]) ++ [ prev.setuptools ];
+              });
+              # socketIO-client 0.7.2 is a legacy package needing setuptools
+              socketio-client = prev.socketio-client.overridePythonAttrs (old: {
+                buildInputs = (old.buildInputs or [ ]) ++ [ prev.setuptools ];
+              });
+              jinja2 = prev.jinja2.overridePythonAttrs (old: {
+                buildInputs = (old.buildInputs or [ ]) ++ [ prev.setuptools ];
+              });
+              # nixpkgs 26.05 + python3.11: build and pyproject-hooks
+              # no longer accept 'tomli' (moved into stdlib as tomllib);
+              # bypass the broken poetry2nix defaultPoetryOverrides entries.
+              build = pkgs.python311Packages.build;
+              pyproject-hooks = pkgs.python311Packages."pyproject-hooks";
+            }
+          );
+        };
     in
     {
       # Critical Python check — run with: nix flake check
@@ -81,64 +132,47 @@
         }
       );
 
+      apps = forAllSystems (
+        system:
+        let
+          pkgs = mkPkgs system;
+          run-dpu = pkgs.writeShellApplication {
+            name = "run-dpu";
+            runtimeInputs = [ (mkDpuPython pkgs) ];
+            text = ''
+              set -euo pipefail
+              if [ ! -f pyproject.toml ] || [ ! -f experiment/template/eVOLVER.py ]; then
+                echo "ERROR: run from the DPU repo root (has pyproject.toml and experiment/template/eVOLVER.py)."
+                exit 1
+              fi
+              exec python experiment/template/eVOLVER.py "$@"
+            '';
+          };
+        in
+        {
+          "run-dpu" = {
+            type = "app";
+            program = "${run-dpu}/bin/run-dpu";
+          };
+
+          default = {
+            type = "app";
+            program = "${run-dpu}/bin/run-dpu";
+          };
+        }
+      );
+
       devShells = forAllSystems (
         system:
         let
           pkgs = mkPkgs system;
-          inherit (poetry2nix.lib.mkPoetry2Nix { inherit pkgs; })
-            mkPoetryEnv
-            defaultPoetryOverrides
-            ;
         in
         {
           default = pkgs.mkShell {
             name = "dpu";
 
             packages = [
-              # Target: Python 3.6. python36 removed from nixpkgs >= 23.05; python39 removed
-              # from nixpkgs >= 25.05. Pin nixpkgs to 22.11 or use an overlay for the exact
-              # interpreter. python39 is kept as an intermediate fallback where available.
-              (mkPoetryEnv {
-                projectDir = ./.;
-                python =
-                  if pkgs ? python36 then pkgs.python36
-                  else if pkgs ? python39 then pkgs.python39
-                  else pkgs.python311;
-                preferWheels = true;
-
-                overrides = defaultPoetryOverrides.extend (
-                  _final: prev: {
-                    # bokeh 0.10.0 pre-dates PEP 517 — needs setuptools.
-                    # Its setup.py calls getsitepackages()[0] which throws
-                    # IndexError in the Nix sandbox (empty list); patch it.
-                    bokeh = prev.bokeh.overridePythonAttrs (old: {
-                      buildInputs = (old.buildInputs or [ ]) ++ [ prev.setuptools ];
-                      postPatch = ''
-                        substituteInPlace setup.py \
-                          --replace 'getsitepackages()[0]' "(getsitepackages() or ['/tmp'])[0]"
-                      '';
-                    });
-                    django = prev.django.overridePythonAttrs (old: {
-                      buildInputs = (old.buildInputs or [ ]) ++ [ prev.setuptools ];
-                    });
-                    django-crispy-forms = prev.django-crispy-forms.overridePythonAttrs (old: {
-                      buildInputs = (old.buildInputs or [ ]) ++ [ prev.setuptools ];
-                    });
-                    # socketIO-client 0.7.2 is a legacy package needing setuptools
-                    socketio-client = prev.socketio-client.overridePythonAttrs (old: {
-                      buildInputs = (old.buildInputs or [ ]) ++ [ prev.setuptools ];
-                    });
-                    jinja2 = prev.jinja2.overridePythonAttrs (old: {
-                      buildInputs = (old.buildInputs or [ ]) ++ [ prev.setuptools ];
-                    });
-                    # nixpkgs 26.05 + python3.11: build and pyproject-hooks
-                    # no longer accept 'tomli' (moved into stdlib as tomllib);
-                    # bypass the broken poetry2nix defaultPoetryOverrides entries.
-                    build = pkgs.python311Packages.build;
-                    pyproject-hooks = pkgs.python311Packages."pyproject-hooks";
-                  }
-                );
-              })
+              (mkDpuPython pkgs)
             ];
 
             shellHook = ''

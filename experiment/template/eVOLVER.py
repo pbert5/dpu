@@ -14,10 +14,17 @@ from scipy import stats
 from socketIO_client import SocketIO, BaseNamespace
 from nbstreamreader import NonBlockingStreamReader as NBSR
 
+try:
+    import socketio as modern_socketio
+except ImportError:
+    modern_socketio = None
+
 import custom_script
 from custom_script import EXP_NAME
 from custom_script import EVOLVER_PORT, OPERATION_MODE
 from custom_script import STIR_INITIAL, TEMP_INITIAL
+
+EVOLVER_PORT = int(os.environ.get('EVOLVER_PORT', EVOLVER_PORT))
 
 # Should not be changed
 # vials to be considered/excluded should be handled
@@ -25,10 +32,11 @@ from custom_script import STIR_INITIAL, TEMP_INITIAL
 VIALS = [x for x in range(16)]
 
 SAVE_PATH = os.path.dirname(os.path.realpath(__file__))
+STATE_PATH = os.environ.get('EVOLVER_DPU_STATE_DIR', SAVE_PATH)
 EXP_DIR = os.path.join(SAVE_PATH, EXP_NAME)
-OD_CAL_PATH = os.path.join(SAVE_PATH, 'od_cal.json')
-TEMP_CAL_PATH = os.path.join(SAVE_PATH, 'temp_cal.json')
-PUMP_CAL_PATH = os.path.join(SAVE_PATH, 'pump_cal.json')
+OD_CAL_PATH = os.path.join(STATE_PATH, 'od_cal.json')
+TEMP_CAL_PATH = os.path.join(STATE_PATH, 'temp_cal.json')
+PUMP_CAL_PATH = os.path.join(STATE_PATH, 'pump_cal.json')
 JSON_PARAMS_FILE = os.path.join(SAVE_PATH, 'eVOLVER_parameters.json')
 
 SIGMOID = 'sigmoid'
@@ -38,6 +46,7 @@ THREE_DIMENSION = '3d'
 logger = logging.getLogger('eVOLVER')
 
 paused = False
+stop_requested = False
 
 EVOLVER_NS = None
 
@@ -48,6 +57,9 @@ class EvolverNamespace(BaseNamespace):
     experiment_params = None
     ip_address = None
     exp_dir = SAVE_PATH
+    broadcasts_seen = 0
+    exit_after_broadcasts = None
+    communication_smoke_only = False
 
     def on_connect(self, *args):
         print("Connected to eVOLVER as client")
@@ -62,10 +74,19 @@ class EvolverNamespace(BaseNamespace):
         logger.info("reconnected to eVOLVER as client")
 
     def on_broadcast(self, data):
+        global stop_requested
+        if stop_requested:
+            return
+        self.broadcasts_seen += 1
+        print("Broadcast received from eVOLVER ({0})".format(self.broadcasts_seen), flush=True)
         logger.info('Broadcast received')
         elapsed_time = round((time.time() - self.start_time) / 3600, 4)
         logger.info('Elapsed time: %.4f hours' % elapsed_time)
         print("{0}: {1} Hours".format(EXP_NAME, elapsed_time))
+        if self.exit_after_broadcasts is not None and self.broadcasts_seen >= self.exit_after_broadcasts:
+            stop_requested = True
+        if self.communication_smoke_only:
+            return
         # are the calibrations in yet?
         if not self.check_for_calibrations():
             logger.warning('Calibration files still missing, skipping custom '
@@ -326,7 +347,7 @@ class EvolverNamespace(BaseNamespace):
             text_file.write(default + '\n')
         text_file.close()
 
-    def initialize_exp(self, vials, experiment_params, log_name, quiet, verbose, ip_address, always_yes = False):
+    def initialize_exp(self, vials, experiment_params, log_name, quiet, verbose, ip_address, always_yes = False, bypass_prompts = False):
         self.ip_address = ip_address
         self.experiment_params = experiment_params
         logger.info('initializing experiment')
@@ -335,7 +356,9 @@ class EvolverNamespace(BaseNamespace):
             setup_logging(log_name, quiet, verbose)
             logger.info('found an existing experiment')
             exp_continue = None
-            if always_yes:
+            if bypass_prompts:
+                exp_continue = 'n'
+            elif always_yes:
                 exp_continue = 'y'
             else:
                 while exp_continue not in ['y', 'n']:
@@ -346,7 +369,7 @@ class EvolverNamespace(BaseNamespace):
         if exp_continue == 'n':
             if os.path.exists(EXP_DIR):
                 exp_overwrite = None
-                if always_yes:
+                if bypass_prompts or always_yes:
                     exp_overwrite = 'y'
                 else:
                     while exp_overwrite not in ['y', 'n']:
@@ -416,6 +439,8 @@ class EvolverNamespace(BaseNamespace):
 
             if always_yes:
                 exp_blank = 'y'
+            elif bypass_prompts:
+                exp_blank = 'n'
             else:
                 exp_blank = input('Calibrate vials to blank? (y/n): ')
             if exp_blank == 'y':
@@ -597,6 +622,74 @@ def setup_logging(filename, quiet, verbose):
                             filename=filename,
                             level=level)
 
+def make_modern_namespace(socketio_client):
+    namespace = EvolverNamespace.__new__(EvolverNamespace)
+    namespace.start_time = None
+    namespace.use_blank = False
+    namespace.OD_initial = None
+    namespace.experiment_params = None
+    namespace.ip_address = None
+    namespace.exp_dir = SAVE_PATH
+    namespace.broadcasts_seen = 0
+    namespace.exit_after_broadcasts = None
+    namespace.communication_smoke_only = False
+
+    def emit(event, data=None, namespace_path='/dpu-evolver', **kwargs):
+        if 'namespace' in kwargs:
+            namespace_path = kwargs['namespace']
+        socketio_client.emit(event, data or {}, namespace=namespace_path)
+
+    namespace.emit = emit
+    return namespace
+
+def run_modern_client(evolver_ip, options, experiment_params):
+    global EVOLVER_NS
+    if modern_socketio is None:
+        raise RuntimeError('python-socketio is required for --socketio-client modern')
+
+    socketIO = modern_socketio.Client(
+        reconnection=True,
+        request_timeout=5,
+    )
+    EVOLVER_NS = make_modern_namespace(socketIO)
+    EVOLVER_NS.exp_dir = EXP_DIR
+    if options.exit_after_broadcasts > 0:
+        EVOLVER_NS.exit_after_broadcasts = options.exit_after_broadcasts
+    EVOLVER_NS.communication_smoke_only = options.communication_smoke_only
+
+    @socketIO.event(namespace='/dpu-evolver')
+    def connect():
+        EVOLVER_NS.on_connect()
+
+    @socketIO.event(namespace='/dpu-evolver')
+    def disconnect():
+        EVOLVER_NS.on_disconnect()
+
+    @socketIO.on('broadcast', namespace='/dpu-evolver')
+    def broadcast(data):
+        EVOLVER_NS.on_broadcast(data)
+
+    @socketIO.on('activecalibrations', namespace='/dpu-evolver')
+    def activecalibrations(data):
+        EVOLVER_NS.on_activecalibrations(data)
+
+    socketIO.connect(
+        'http://{0}:{1}'.format(evolver_ip, EVOLVER_PORT),
+        namespaces=['/dpu-evolver'],
+        wait_timeout=5,
+    )
+    return socketIO, EVOLVER_NS
+
+def run_legacy_client(evolver_ip, options, experiment_params):
+    global EVOLVER_NS
+    socketIO = SocketIO(evolver_ip, EVOLVER_PORT)
+    EVOLVER_NS = socketIO.define(EvolverNamespace, '/dpu-evolver')
+    EVOLVER_NS.exp_dir = EXP_DIR
+    if options.exit_after_broadcasts > 0:
+        EVOLVER_NS.exit_after_broadcasts = options.exit_after_broadcasts
+    EVOLVER_NS.communication_smoke_only = options.communication_smoke_only
+    return socketIO, EVOLVER_NS
+
 def get_options():
     description = 'Run an eVOLVER experiment from the command line'
     parser = argparse.ArgumentParser(description=description)
@@ -612,6 +705,21 @@ def get_options():
                         help='Log file name directory (default: %(default)s)')
     parser.add_argument('-i', '--ip-address', action='store', dest='ip_address',
                         help='IP address of eVOLVER to run experiment on.')
+    parser.add_argument('--bypass-prompts', action='store_true',
+                        default=os.environ.get('EVOLVER_DPU_BYPASS_PROMPTS', '').lower() in ('1', 'true', 'yes'),
+                        help='Run startup without prompts: start a new experiment, overwrite existing data, and skip blanking.')
+    parser.add_argument('--exit-after-broadcasts', action='store', type=int,
+                        default=int(os.environ.get('EVOLVER_DPU_EXIT_AFTER_BROADCASTS', '0') or '0'),
+                        help='Exit after receiving this many broadcasts; 0 means run forever.')
+    parser.add_argument('--experiment-dir', action='store', dest='experiment_dir',
+                        default=os.environ.get('EVOLVER_DPU_EXP_DIR'),
+                        help='Override the experiment output directory.')
+    parser.add_argument('--socketio-client', choices=['legacy', 'modern'],
+                        default=os.environ.get('EVOLVER_DPU_SOCKETIO_CLIENT', 'legacy'),
+                        help='Socket.IO client implementation to use.')
+    parser.add_argument('--communication-smoke-only', action='store_true',
+                        default=os.environ.get('EVOLVER_DPU_COMMUNICATION_SMOKE_ONLY', '').lower() in ('1', 'true', 'yes'),
+                        help='For integration tests: exit after proving connection and broadcast receipt without running experiment logic.')
 
     log_nolog = parser.add_mutually_exclusive_group()
     log_nolog.add_argument('-v', '--verbose', action='count',
@@ -625,6 +733,12 @@ def get_options():
 
 if __name__ == '__main__':
     options, parser = get_options()
+    if options.experiment_dir:
+        EXP_DIR = os.path.abspath(options.experiment_dir)
+        default_log_name = os.path.join(SAVE_PATH, EXP_NAME, 'evolver.log')
+        if options.log_name == default_log_name:
+            options.log_name = os.path.join(EXP_DIR, 'evolver.log')
+    os.makedirs(STATE_PATH, exist_ok=True)
 
 
     #changes terminal tab title in OSX
@@ -640,8 +754,10 @@ if __name__ == '__main__':
         parser.print_help()
         sys.exit(2)
 
-    socketIO = SocketIO(evolver_ip, EVOLVER_PORT)
-    EVOLVER_NS = socketIO.define(EvolverNamespace, '/dpu-evolver')
+    if options.socketio_client == 'modern':
+        socketIO, EVOLVER_NS = run_modern_client(evolver_ip, options, experiment_params)
+    else:
+        socketIO, EVOLVER_NS = run_legacy_client(evolver_ip, options, experiment_params)
 
     # start by stopping any existing chemostat
     EVOLVER_NS.stop_all_pumps()
@@ -652,12 +768,13 @@ if __name__ == '__main__':
                                                       options.quiet,
                                                       options.verbose,
                                                       evolver_ip,
-                                                      options.always_yes
+                                                      options.always_yes,
+                                                      options.bypass_prompts
                                                       )
 
     # Using a non-blocking stream reader to be able to listen
     # for commands from the electron app. 
-    nbsr = NBSR(sys.stdin)
+    nbsr = None if options.bypass_prompts else NBSR(sys.stdin)
     paused = False
 
     # logging setup
@@ -668,7 +785,7 @@ if __name__ == '__main__':
             # infinite loop
 
             # check if a message has come in from the DPU
-            message = nbsr.readline()
+            message = nbsr.readline() if nbsr is not None else ''
             if 'stop-script' in message:
                 logger.info('Stop message received - halting all pumps');
                 EVOLVER_NS.stop_exp()
@@ -686,17 +803,33 @@ if __name__ == '__main__':
                 paused = False
                 socketIO.connect()
 
+            if stop_requested:
+                print('Broadcast target reached, shutting down', flush=True)
+                EVOLVER_NS.stop_exp()
+                socketIO.disconnect()
+                break
+
             if not paused:
+                if options.socketio_client == 'modern':
+                    time.sleep(0.1)
+                else:
                     socketIO.wait(seconds=0.1)
-                    if time.time() - reset_connection_timer > 3600 and not paused:
-                        # reset connection to avoid buildup of broadcast
-                        # messages (unlikely but could happen for very long
-                        # experiments with slow dpu code/computer)
-                        logger.info('resetting connection to eVOLVER to avoid '
-                                    'potential buildup of broadcast messages')
-                        socketIO.disconnect()
+                if time.time() - reset_connection_timer > 3600 and not paused:
+                    # reset connection to avoid buildup of broadcast
+                    # messages (unlikely but could happen for very long
+                    # experiments with slow dpu code/computer)
+                    logger.info('resetting connection to eVOLVER to avoid '
+                                'potential buildup of broadcast messages')
+                    socketIO.disconnect()
+                    if options.socketio_client == 'modern':
+                        socketIO.connect(
+                            'http://{0}:{1}'.format(evolver_ip, EVOLVER_PORT),
+                            namespaces=['/dpu-evolver'],
+                            wait_timeout=5,
+                        )
+                    else:
                         socketIO.connect()
-                        reset_connection_timer = time.time()
+                    reset_connection_timer = time.time()
         except KeyboardInterrupt:
             try:
                 print('Ctrl-C detected, pausing experiment')
@@ -731,5 +864,6 @@ if __name__ == '__main__':
 
     # stop experiment one last time
     # covers corner case where user presses Ctrl-C twice quickly
-    socketIO.connect()
-    EVOLVER_NS.stop_exp()
+    if not stop_requested:
+        socketIO.connect()
+        EVOLVER_NS.stop_exp()
