@@ -17,6 +17,13 @@
         "aarch64-linux"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
+      mkApp =
+        program: description:
+        {
+          type = "app";
+          inherit program;
+          meta.description = description;
+        };
 
       # nixpkgs 26.05: python311Packages.pip-25.3 has sphinx-9.1.0 in
       # nativeBuildInputs, but sphinx-9.1 requires Python >=3.12 — replace
@@ -150,15 +157,9 @@
           };
         in
         {
-          "run-dpu" = {
-            type = "app";
-            program = "${run-dpu}/bin/run-dpu";
-          };
+          "run-dpu" = mkApp "${run-dpu}/bin/run-dpu" "Run the DPU experiment controller.";
 
-          default = {
-            type = "app";
-            program = "${run-dpu}/bin/run-dpu";
-          };
+          default = mkApp "${run-dpu}/bin/run-dpu" "Run the DPU experiment controller.";
         }
       );
 
